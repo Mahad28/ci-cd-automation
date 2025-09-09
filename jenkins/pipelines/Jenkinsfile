@@ -1,0 +1,255 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'your-registry.com'
+        IMAGE_NAME = 'test-automation'
+        KUBECONFIG = credentials('kubeconfig')
+        SONAR_TOKEN = credentials('sonar-token')
+        SLACK_WEBHOOK = credentials('slack-webhook')
+    }
+    
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Code Quality') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    steps {
+                        script {
+                            def scannerHome = tool 'SonarQubeScanner'
+                            withSonarQubeEnv('SonarQube') {
+                                sh "${scannerHome}/bin/sonar-scanner"
+                            }
+                        }
+                    }
+                }
+                
+                stage('Security Scan') {
+                    steps {
+                        sh 'mvn org.owasp:dependency-check-maven:check'
+                    }
+                }
+                
+                stage('Code Coverage') {
+                    steps {
+                        sh 'mvn clean test jacoco:report'
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'target/site/jacoco',
+                            reportFiles: 'index.html',
+                            reportName: 'Code Coverage Report'
+                        ])
+                    }
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh 'mvn clean compile package -DskipTests'
+                archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+            }
+        }
+        
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh 'mvn test -Dtest=**/*Test'
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'target/surefire-reports/*.xml'
+                        }
+                    }
+                }
+                
+                stage('Integration Tests') {
+                    steps {
+                        sh 'mvn test -Dtest=**/*IT'
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'target/surefire-reports/*.xml'
+                        }
+                    }
+                }
+                
+                stage('API Tests') {
+                    steps {
+                        sh 'mvn test -Dtest=**/*ApiTest'
+                    }
+                    post {
+                        always {
+                            publishTestResults testResultsPattern: 'target/surefire-reports/*.xml'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Docker Build') {
+            steps {
+                script {
+                    def image = docker.build("${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.GIT_COMMIT_SHORT}")
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        image.push()
+                        image.push('latest')
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    sh """
+                        kubectl set image deployment/test-automation-staging \
+                        test-automation=${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.GIT_COMMIT_SHORT} \
+                        --namespace=staging
+                    """
+                }
+            }
+            post {
+                success {
+                    sh """
+                        kubectl rollout status deployment/test-automation-staging \
+                        --namespace=staging --timeout=300s
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sh """
+                        kubectl set image deployment/test-automation-prod \
+                        test-automation=${DOCKER_REGISTRY}/${IMAGE_NAME}:${env.GIT_COMMIT_SHORT} \
+                        --namespace=production
+                    """
+                }
+            }
+            post {
+                success {
+                    sh """
+                        kubectl rollout status deployment/test-automation-prod \
+                        --namespace=production --timeout=300s
+                    """
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh 'mvn test -Dtest=**/*PerformanceTest'
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'target/performance-reports',
+                        reportFiles: 'index.html',
+                        reportName: 'Performance Test Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Security Tests') {
+            steps {
+                sh 'mvn test -Dtest=**/*SecurityTest'
+            }
+            post {
+                always {
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'target/security-reports',
+                        reportFiles: 'index.html',
+                        reportName: 'Security Test Report'
+                    ])
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        
+        success {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    slackSend(
+                        channel: '#deployments',
+                        color: 'good',
+                        message: "✅ Production deployment successful!\n" +
+                                "Build: ${env.BUILD_NUMBER}\n" +
+                                "Commit: ${env.GIT_COMMIT_SHORT}\n" +
+                                "URL: ${env.BUILD_URL}"
+                    )
+                }
+            }
+        }
+        
+        failure {
+            script {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'danger',
+                    message: "❌ Build failed!\n" +
+                            "Build: ${env.BUILD_NUMBER}\n" +
+                            "Branch: ${env.BRANCH_NAME}\n" +
+                            "URL: ${env.BUILD_URL}"
+                )
+            }
+        }
+        
+        unstable {
+            script {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'warning',
+                    message: "⚠️ Build unstable!\n" +
+                            "Build: ${env.BUILD_NUMBER}\n" +
+                            "Branch: ${env.BRANCH_NAME}\n" +
+                            "URL: ${env.BUILD_URL}"
+                )
+            }
+        }
+    }
+}
